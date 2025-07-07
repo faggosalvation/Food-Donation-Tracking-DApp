@@ -2,7 +2,7 @@
 
 (define-data-var admin principal tx-sender)
 
-(define-map donations
+(define-map basic-donations
     { donation-id: uint }
     {
         donor: principal,
@@ -60,7 +60,7 @@
             ))
         )
         (asserts! (> amount u0) ERR-INVALID-AMOUNT)
-        (map-set donations { donation-id: donation-id } {
+        (map-set basic-donations { donation-id: donation-id } {
             donor: tx-sender,
             recipient: recipient,
             amount: amount,
@@ -78,7 +78,7 @@
 )
 (define-public (verify-donation (donation-id uint))
     (let (
-            (donation (unwrap! (map-get? donations { donation-id: donation-id })
+            (donation (unwrap! (map-get? basic-donations { donation-id: donation-id })
                 ERR-DONATION-NOT-FOUND
             ))
             (recipient-key { recipient: (get recipient donation) })
@@ -86,7 +86,7 @@
         )
         (asserts! (is-eq tx-sender (get recipient donation)) ERR-NOT-AUTHORIZED)
         (asserts! (not (get verified donation)) ERR-ALREADY-VERIFIED)
-        (map-set donations { donation-id: donation-id }
+        (map-set basic-donations { donation-id: donation-id }
             (merge donation {
                 status: "verified",
                 verified: true,
@@ -126,8 +126,8 @@
     )
 )
 
-(define-read-only (get-donation (donation-id uint))
-    (map-get? donations { donation-id: donation-id })
+(define-read-only (get-basic-donation (donation-id uint))
+    (map-get? basic-donations { donation-id: donation-id })
 )
 
 (define-read-only (get-donor-stats (donor principal))
@@ -143,5 +143,360 @@
         (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
         (var-set admin new-admin)
         (ok true)
+    )
+)
+(define-constant ERR-NOT-FOUND (err u404))
+(define-constant ERR-EXPIRED (err u405))
+(define-constant ERR-ALREADY-CLAIMED (err u406))
+
+(define-data-var next-donation-id uint u1)
+
+(define-map expiring-donations
+    { donation-id: uint }
+    {
+        donor: principal,
+        original-recipient: principal,
+        amount: uint,
+        created-at: uint,
+        expiry-block: uint,
+        status: (string-ascii 20),
+        claimed-by: (optional principal),
+    }
+)
+
+(define-map alternative-recipients
+    {
+        donation-id: uint,
+        recipient-index: uint,
+    }
+    { recipient: principal }
+)
+
+(define-public (create-expiring-donation
+        (recipient principal)
+        (amount uint)
+        (expiry-blocks uint)
+        (alternatives (list 5 principal))
+    )
+    (let (
+            (donation-id (var-get next-donation-id))
+            (current-block burn-block-height)
+            (expiry-block (+ current-block expiry-blocks))
+        )
+        (asserts! (> amount u0) (err u400))
+        (asserts! (> expiry-blocks u0) (err u401))
+        (map-set expiring-donations { donation-id: donation-id } {
+            donor: tx-sender,
+            original-recipient: recipient,
+            amount: amount,
+            created-at: current-block,
+            expiry-block: expiry-block,
+            status: "active",
+            claimed-by: none,
+        })
+        (set-alternative-recipients donation-id alternatives)
+        (var-set next-donation-id (+ donation-id u1))
+        (ok donation-id)
+    )
+)
+
+(define-private (set-alternative-recipients
+        (donation-id uint)
+        (alternatives (list 5 principal))
+    )
+    (fold add-alternative-recipient alternatives {
+        donation-id: donation-id,
+        index: u0,
+    })
+)
+
+(define-private (add-alternative-recipient
+        (recipient principal)
+        (data {
+            donation-id: uint,
+            index: uint,
+        })
+    )
+    (begin
+        (map-set alternative-recipients {
+            donation-id: (get donation-id data),
+            recipient-index: (get index data),
+        } { recipient: recipient }
+        )
+        {
+            donation-id: (get donation-id data),
+            index: (+ (get index data) u1),
+        }
+    )
+)
+
+(define-public (claim-donation (donation-id uint))
+    (let (
+            (donation-data (unwrap! (map-get? expiring-donations { donation-id: donation-id })
+                ERR-NOT-FOUND
+            ))
+            (current-block burn-block-height)
+        )
+        (asserts! (is-eq (get status donation-data) "active") ERR-ALREADY-CLAIMED)
+        (asserts! (< current-block (get expiry-block donation-data)) ERR-EXPIRED)
+        (asserts! (is-eq tx-sender (get original-recipient donation-data))
+            ERR-NOT-AUTHORIZED
+        )
+        (map-set expiring-donations { donation-id: donation-id }
+            (merge donation-data {
+                status: "claimed",
+                claimed-by: (some tx-sender),
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (redistribute-expired-donation
+        (donation-id uint)
+        (recipient-index uint)
+    )
+    (let (
+            (donation-data (unwrap! (map-get? expiring-donations { donation-id: donation-id })
+                ERR-NOT-FOUND
+            ))
+            (alternative-data (unwrap!
+                (map-get? alternative-recipients {
+                    donation-id: donation-id,
+                    recipient-index: recipient-index,
+                })
+                ERR-NOT-FOUND
+            ))
+            (current-block burn-block-height)
+        )
+        (asserts! (is-eq (get status donation-data) "active") ERR-ALREADY-CLAIMED)
+        (asserts! (>= current-block (get expiry-block donation-data)) (err u402))
+        (asserts! (is-eq tx-sender (get recipient alternative-data))
+            ERR-NOT-AUTHORIZED
+        )
+        (map-set expiring-donations { donation-id: donation-id }
+            (merge donation-data {
+                status: "redistributed",
+                claimed-by: (some tx-sender),
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-expiring-donation (donation-id uint))
+    (map-get? expiring-donations { donation-id: donation-id })
+)
+
+(define-read-only (get-alternative-recipient
+        (donation-id uint)
+        (recipient-index uint)
+    )
+    (map-get? alternative-recipients {
+        donation-id: donation-id,
+        recipient-index: recipient-index,
+    })
+)
+(define-constant ERR-ALREADY-RATED (err u408))
+(define-constant ERR-INVALID-RATING (err u409))
+(define-constant ERR-CANNOT-RATE-SELF (err u410))
+
+(define-data-var next-rating-id uint u1)
+
+(define-map user-reputation
+    { user: principal }
+    {
+        total-donations: uint,
+        total-received: uint,
+        average-rating: uint,
+        total-ratings: uint,
+        reputation-score: uint,
+    }
+)
+
+(define-map donation-ratings
+    { donation-id: uint }
+    {
+        donor-rating: (optional uint),
+        recipient-rating: (optional uint),
+        donor-feedback: (optional (string-ascii 200)),
+        recipient-feedback: (optional (string-ascii 200)),
+        rated-by-donor: bool,
+        rated-by-recipient: bool,
+    }
+)
+
+(define-map individual-ratings
+    { rating-id: uint }
+    {
+        rater: principal,
+        rated-user: principal,
+        donation-id: uint,
+        rating: uint,
+        feedback: (string-ascii 200),
+        timestamp: uint,
+    }
+)
+
+(define-public (initialize-donation-rating
+        (donation-id uint)
+        (donor principal)
+        (recipient principal)
+    )
+    (begin
+        (map-set donation-ratings { donation-id: donation-id } {
+            donor-rating: none,
+            recipient-rating: none,
+            donor-feedback: none,
+            recipient-feedback: none,
+            rated-by-donor: false,
+            rated-by-recipient: false,
+        })
+        (ok true)
+    )
+)
+
+(define-public (rate-user
+        (donation-id uint)
+        (rated-user principal)
+        (rating uint)
+        (feedback (string-ascii 200))
+    )
+    (let (
+            (rating-data (unwrap! (map-get? donation-ratings { donation-id: donation-id })
+                ERR-NOT-FOUND
+            ))
+            (rating-id (var-get next-rating-id))
+        )
+        (asserts! (not (is-eq tx-sender rated-user)) ERR-CANNOT-RATE-SELF)
+        (asserts! (and (>= rating u1) (<= rating u5)) ERR-INVALID-RATING)
+        (let (
+                (is-donor-rating (not (get rated-by-donor rating-data)))
+                (is-recipient-rating (not (get rated-by-recipient rating-data)))
+            )
+            (asserts! (or is-donor-rating is-recipient-rating) ERR-ALREADY-RATED)
+            (map-set individual-ratings { rating-id: rating-id } {
+                rater: tx-sender,
+                rated-user: rated-user,
+                donation-id: donation-id,
+                rating: rating,
+                feedback: feedback,
+                timestamp: burn-block-height,
+            })
+            (if is-donor-rating
+                (map-set donation-ratings { donation-id: donation-id }
+                    (merge rating-data {
+                        donor-rating: (some rating),
+                        donor-feedback: (some feedback),
+                        rated-by-donor: true,
+                    })
+                )
+                (map-set donation-ratings { donation-id: donation-id }
+                    (merge rating-data {
+                        recipient-rating: (some rating),
+                        recipient-feedback: (some feedback),
+                        rated-by-recipient: true,
+                    })
+                )
+            )
+            (update-user-reputation rated-user rating)
+            (var-set next-rating-id (+ rating-id u1))
+            (ok rating-id)
+        )
+    )
+)
+
+(define-private (update-user-reputation
+        (user principal)
+        (new-rating uint)
+    )
+    (let (
+            (current-rep (default-to {
+                total-donations: u0,
+                total-received: u0,
+                average-rating: u0,
+                total-ratings: u0,
+                reputation-score: u0,
+            }
+                (map-get? user-reputation { user: user })
+            ))
+            (new-total-ratings (+ (get total-ratings current-rep) u1))
+            (new-average (/
+                (+
+                    (* (get average-rating current-rep)
+                        (get total-ratings current-rep)
+                    )
+                    new-rating
+                )
+                new-total-ratings
+            ))
+            (new-reputation-score (calculate-reputation-score new-average new-total-ratings))
+        )
+        (map-set user-reputation { user: user }
+            (merge current-rep {
+                average-rating: new-average,
+                total-ratings: new-total-ratings,
+                reputation-score: new-reputation-score,
+            })
+        )
+    )
+)
+
+(define-private (calculate-reputation-score
+        (average-rating uint)
+        (total-ratings uint)
+    )
+    (let (
+            (base-score (* average-rating u20))
+            (volume-bonus (if (> total-ratings u10)
+                u10
+                total-ratings
+            ))
+        )
+        (+ base-score volume-bonus)
+    )
+)
+
+(define-public (update-donation-count
+        (user principal)
+        (is-donor bool)
+    )
+    (let ((current-rep (default-to {
+            total-donations: u0,
+            total-received: u0,
+            average-rating: u0,
+            total-ratings: u0,
+            reputation-score: u0,
+        }
+            (map-get? user-reputation { user: user })
+        )))
+        (if is-donor
+            (map-set user-reputation { user: user }
+                (merge current-rep { total-donations: (+ (get total-donations current-rep) u1) })
+            )
+            (map-set user-reputation { user: user }
+                (merge current-rep { total-received: (+ (get total-received current-rep) u1) })
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-user-reputation (user principal))
+    (map-get? user-reputation { user: user })
+)
+
+(define-read-only (get-donation-ratings (donation-id uint))
+    (map-get? donation-ratings { donation-id: donation-id })
+)
+
+(define-read-only (get-individual-rating (rating-id uint))
+    (map-get? individual-ratings { rating-id: rating-id })
+)
+
+(define-read-only (get-reputation-score (user principal))
+    (match (map-get? user-reputation { user: user })
+        reputation (ok (get reputation-score reputation))
+        ERR-NOT-FOUND
     )
 )

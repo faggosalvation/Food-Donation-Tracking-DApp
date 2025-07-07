@@ -1,34 +1,22 @@
-const { assertEquals, types } = require('@stacks/assertions');
-const { Client, Provider, ProviderRegistry } = require('@stacks/rpc-client');
+import { describe, expect, it } from "vitest";
 
-describe('Food Donation Tracking Tests', () => {
-  let client;
-  let provider;
+const accounts = simnet.getAccounts();
+const address1 = accounts.get("wallet_1")!;
 
-  before(async () => {
-    provider = await ProviderRegistry.createProvider();
-    client = new Client({ provider });
+/*
+  The test below is an example. To learn more, read the testing documentation here:
+  https://docs.hiro.so/stacks/clarinet-js-sdk
+*/
+
+describe("example tests", () => {
+  it("ensures simnet is well initialised", () => {
+    expect(simnet.blockHeight).toBeDefined();
   });
 
-  it('should create donation successfully', async () => {
-    const amount = 100;
-    const recipient = 'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM';
-
-    const result = await client.createDonation(recipient, amount);
-    assertEquals(result.success, true);
-  });
-
-  it('should verify donation successfully', async () => {
-    const donationId = 1;
-    const result = await client.verifyDonation(donationId);
-    assertEquals(result.success, true);
-  });
-
-  it('should fail with invalid amount', async () => {
-    const amount = 0;
-    const recipient = 'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM';
-
-    const result = await client.createDonation(recipient, amount);
-    assertEquals(result.error, 'ERR-INVALID-AMOUNT');
-  });
+  // it("shows an example", () => {
+  //   const { result } = simnet.callReadOnlyFn("counter", "get-counter", [], address1);
+  //   expect(result).toBeUint(0);
+  // });
 });
+
+
