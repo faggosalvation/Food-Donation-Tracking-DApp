@@ -500,3 +500,224 @@
         ERR-NOT-FOUND
     )
 )
+
+(define-constant ERR-MILESTONE-NOT-FOUND (err u411))
+(define-constant ERR-MILESTONE-ALREADY-COMPLETED (err u412))
+(define-constant ERR-ALL-MILESTONES-NOT-COMPLETED (err u413))
+(define-constant ERR-FUNDS-ALREADY-RELEASED (err u414))
+
+(define-data-var next-milestone-donation-id uint u1)
+
+(define-map milestone-donations
+    { milestone-donation-id: uint }
+    {
+        donor: principal,
+        recipient: principal,
+        total-amount: uint,
+        released-amount: uint,
+        milestone-count: uint,
+        completed-milestones: uint,
+        created-at: uint,
+        status: (string-ascii 20),
+    }
+)
+
+(define-map donation-milestones
+    {
+        milestone-donation-id: uint,
+        milestone-index: uint,
+    }
+    {
+        description: (string-ascii 100),
+        amount: uint,
+        completed: bool,
+        completed-by: (optional principal),
+        approved-by-donor: bool,
+        completion-timestamp: (optional uint),
+        approval-timestamp: (optional uint),
+    }
+)
+
+(define-public (create-milestone-donation
+        (recipient principal)
+        (milestone-descriptions (list 5 (string-ascii 100)))
+        (milestone-amounts (list 5 uint))
+    )
+    (let (
+            (milestone-donation-id (var-get next-milestone-donation-id))
+            (total-amount (fold + milestone-amounts u0))
+            (milestone-count (len milestone-descriptions))
+        )
+        (asserts! (> total-amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (is-eq (len milestone-descriptions) (len milestone-amounts))
+            (err u415)
+        )
+        (asserts! (> milestone-count u0) (err u416))
+        (map-set milestone-donations { milestone-donation-id: milestone-donation-id } {
+            donor: tx-sender,
+            recipient: recipient,
+            total-amount: total-amount,
+            released-amount: u0,
+            milestone-count: milestone-count,
+            completed-milestones: u0,
+            created-at: burn-block-height,
+            status: "active",
+        })
+        (fold setup-milestone-with-index milestone-descriptions {
+            milestone-donation-id: milestone-donation-id,
+            index: u0,
+            amounts: milestone-amounts,
+        })
+        (var-set next-milestone-donation-id (+ milestone-donation-id u1))
+        (ok milestone-donation-id)
+    )
+)
+
+(define-private (setup-milestone-with-index
+        (description (string-ascii 100))
+        (context {
+            milestone-donation-id: uint,
+            index: uint,
+            amounts: (list 5 uint),
+        })
+    )
+    (let ((amount (default-to u0 (element-at (get amounts context) (get index context)))))
+        (map-set donation-milestones {
+            milestone-donation-id: (get milestone-donation-id context),
+            milestone-index: (get index context),
+        } {
+            description: description,
+            amount: amount,
+            completed: false,
+            completed-by: none,
+            approved-by-donor: false,
+            completion-timestamp: none,
+            approval-timestamp: none,
+        })
+        {
+            milestone-donation-id: (get milestone-donation-id context),
+            index: (+ (get index context) u1),
+            amounts: (get amounts context),
+        }
+    )
+)
+
+(define-public (complete-milestone
+        (milestone-donation-id uint)
+        (milestone-index uint)
+    )
+    (let (
+            (donation-data (unwrap!
+                (map-get? milestone-donations { milestone-donation-id: milestone-donation-id })
+                ERR-NOT-FOUND
+            ))
+            (milestone-data (unwrap!
+                (map-get? donation-milestones {
+                    milestone-donation-id: milestone-donation-id,
+                    milestone-index: milestone-index,
+                })
+                ERR-MILESTONE-NOT-FOUND
+            ))
+        )
+        (asserts! (is-eq tx-sender (get recipient donation-data))
+            ERR-NOT-AUTHORIZED
+        )
+        (asserts! (not (get completed milestone-data))
+            ERR-MILESTONE-ALREADY-COMPLETED
+        )
+        (map-set donation-milestones {
+            milestone-donation-id: milestone-donation-id,
+            milestone-index: milestone-index,
+        }
+            (merge milestone-data {
+                completed: true,
+                completed-by: (some tx-sender),
+                completion-timestamp: (some burn-block-height),
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (approve-milestone
+        (milestone-donation-id uint)
+        (milestone-index uint)
+    )
+    (let (
+            (donation-data (unwrap!
+                (map-get? milestone-donations { milestone-donation-id: milestone-donation-id })
+                ERR-NOT-FOUND
+            ))
+            (milestone-data (unwrap!
+                (map-get? donation-milestones {
+                    milestone-donation-id: milestone-donation-id,
+                    milestone-index: milestone-index,
+                })
+                ERR-MILESTONE-NOT-FOUND
+            ))
+        )
+        (asserts! (is-eq tx-sender (get donor donation-data)) ERR-NOT-AUTHORIZED)
+        (asserts! (get completed milestone-data) (err u417))
+        (asserts! (not (get approved-by-donor milestone-data)) (err u418))
+        (map-set donation-milestones {
+            milestone-donation-id: milestone-donation-id,
+            milestone-index: milestone-index,
+        }
+            (merge milestone-data {
+                approved-by-donor: true,
+                approval-timestamp: (some burn-block-height),
+            })
+        )
+        (map-set milestone-donations { milestone-donation-id: milestone-donation-id }
+            (merge donation-data {
+                completed-milestones: (+ (get completed-milestones donation-data) u1),
+                released-amount: (+ (get released-amount donation-data)
+                    (get amount milestone-data)
+                ),
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (release-completed-funds (milestone-donation-id uint))
+    (let ((donation-data (unwrap!
+            (map-get? milestone-donations { milestone-donation-id: milestone-donation-id })
+            ERR-NOT-FOUND
+        )))
+        (asserts! (is-eq tx-sender (get recipient donation-data))
+            ERR-NOT-AUTHORIZED
+        )
+        (asserts! (> (get released-amount donation-data) u0) (err u419))
+        (ok (get released-amount donation-data))
+    )
+)
+
+(define-read-only (get-milestone-donation (milestone-donation-id uint))
+    (map-get? milestone-donations { milestone-donation-id: milestone-donation-id })
+)
+
+(define-read-only (get-milestone-details
+        (milestone-donation-id uint)
+        (milestone-index uint)
+    )
+    (map-get? donation-milestones {
+        milestone-donation-id: milestone-donation-id,
+        milestone-index: milestone-index,
+    })
+)
+
+(define-read-only (get-milestone-progress (milestone-donation-id uint))
+    (match (map-get? milestone-donations { milestone-donation-id: milestone-donation-id })
+        donation-data (ok {
+            total-milestones: (get milestone-count donation-data),
+            completed-milestones: (get completed-milestones donation-data),
+            progress-percentage: (/ (* (get completed-milestones donation-data) u100)
+                (get milestone-count donation-data)
+            ),
+            funds-released: (get released-amount donation-data),
+            total-funds: (get total-amount donation-data),
+        })
+        ERR-NOT-FOUND
+    )
+)
