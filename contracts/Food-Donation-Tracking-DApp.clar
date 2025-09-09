@@ -721,3 +721,248 @@
         ERR-NOT-FOUND
     )
 )
+
+(define-constant ERR-PLEDGE-NOT-FOUND (err u420))
+(define-constant ERR-INSUFFICIENT-PLEDGE-FUNDS (err u421))
+(define-constant ERR-PLEDGE-EXPIRED (err u422))
+(define-constant ERR-PLEDGE-EXHAUSTED (err u423))
+(define-constant ERR-DONATION-NOT-ELIGIBLE (err u424))
+
+(define-data-var next-pledge-id uint u1)
+
+(define-map matching-pledges
+    { pledge-id: uint }
+    {
+        pledger: principal,
+        target-recipient: (optional principal),
+        max-match-amount: uint,
+        remaining-amount: uint,
+        match-ratio: uint,
+        created-at: uint,
+        expires-at: uint,
+        active: bool,
+    }
+)
+
+(define-map matched-donations
+    { donation-id: uint }
+    {
+        original-donor: principal,
+        recipient: principal,
+        original-amount: uint,
+        matched-amount: uint,
+        pledge-id: uint,
+        pledger: principal,
+        verified: bool,
+        created-at: uint,
+    }
+)
+
+(define-map pledge-stats
+    { pledger: principal }
+    {
+        total-pledges-created: uint,
+        total-amount-pledged: uint,
+        total-amount-matched: uint,
+        active-pledges: uint,
+    }
+)
+
+(define-public (create-matching-pledge
+        (target-recipient (optional principal))
+        (max-match-amount uint)
+        (match-ratio uint)
+        (expiry-blocks uint)
+    )
+    (let (
+            (pledge-id (var-get next-pledge-id))
+            (current-block burn-block-height)
+            (expires-at (+ current-block expiry-blocks))
+            (pledger-key { pledger: tx-sender })
+            (current-stats (default-to {
+                total-pledges-created: u0,
+                total-amount-pledged: u0,
+                total-amount-matched: u0,
+                active-pledges: u0,
+            }
+                (map-get? pledge-stats pledger-key)
+            ))
+        )
+        (asserts! (> max-match-amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (and (> match-ratio u0) (<= match-ratio u100)) (err u425))
+        (asserts! (> expiry-blocks u0) (err u426))
+        (map-set matching-pledges { pledge-id: pledge-id } {
+            pledger: tx-sender,
+            target-recipient: target-recipient,
+            max-match-amount: max-match-amount,
+            remaining-amount: max-match-amount,
+            match-ratio: match-ratio,
+            created-at: current-block,
+            expires-at: expires-at,
+            active: true,
+        })
+        (map-set pledge-stats pledger-key {
+            total-pledges-created: (+ (get total-pledges-created current-stats) u1),
+            total-amount-pledged: (+ (get total-amount-pledged current-stats) max-match-amount),
+            total-amount-matched: (get total-amount-matched current-stats),
+            active-pledges: (+ (get active-pledges current-stats) u1),
+        })
+        (var-set next-pledge-id (+ pledge-id u1))
+        (ok pledge-id)
+    )
+)
+
+(define-public (make-matched-donation
+        (recipient principal)
+        (amount uint)
+        (pledge-id uint)
+    )
+    (let (
+            (pledge-data (unwrap! (map-get? matching-pledges { pledge-id: pledge-id })
+                ERR-PLEDGE-NOT-FOUND
+            ))
+            (donation-id (+ (var-get donation-counter) u1))
+            (current-block burn-block-height)
+            (match-amount (/ (* amount (get match-ratio pledge-data)) u100))
+            (pledger-key { pledger: (get pledger pledge-data) })
+            (current-stats (default-to {
+                total-pledges-created: u0,
+                total-amount-pledged: u0,
+                total-amount-matched: u0,
+                active-pledges: u0,
+            }
+                (map-get? pledge-stats pledger-key)
+            ))
+        )
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (get active pledge-data) (err u427))
+        (asserts! (< current-block (get expires-at pledge-data))
+            ERR-PLEDGE-EXPIRED
+        )
+        (asserts! (>= (get remaining-amount pledge-data) match-amount)
+            ERR-INSUFFICIENT-PLEDGE-FUNDS
+        )
+        (match (get target-recipient pledge-data)
+            target-recipient (asserts! (is-eq recipient target-recipient)
+                ERR-DONATION-NOT-ELIGIBLE
+            )
+            true
+        )
+        (map-set basic-donations { donation-id: donation-id } {
+            donor: tx-sender,
+            recipient: recipient,
+            amount: amount,
+            status: "pending",
+            timestamp: current-block,
+            verified: false,
+        })
+        (map-set matched-donations { donation-id: donation-id } {
+            original-donor: tx-sender,
+            recipient: recipient,
+            original-amount: amount,
+            matched-amount: match-amount,
+            pledge-id: pledge-id,
+            pledger: (get pledger pledge-data),
+            verified: false,
+            created-at: current-block,
+        })
+        (map-set matching-pledges { pledge-id: pledge-id }
+            (merge pledge-data { remaining-amount: (- (get remaining-amount pledge-data) match-amount) })
+        )
+        (map-set pledge-stats pledger-key {
+            total-pledges-created: (get total-pledges-created current-stats),
+            total-amount-pledged: (get total-amount-pledged current-stats),
+            total-amount-matched: (+ (get total-amount-matched current-stats) match-amount),
+            active-pledges: (get active-pledges current-stats),
+        })
+        (var-set donation-counter donation-id)
+        (ok donation-id)
+    )
+)
+
+(define-public (verify-matched-donation (donation-id uint))
+    (let (
+            (donation-data (unwrap! (map-get? basic-donations { donation-id: donation-id })
+                ERR-DONATION-NOT-FOUND
+            ))
+            (matched-data (unwrap! (map-get? matched-donations { donation-id: donation-id })
+                ERR-NOT-FOUND
+            ))
+        )
+        (asserts! (is-eq tx-sender (get recipient donation-data))
+            ERR-NOT-AUTHORIZED
+        )
+        (asserts! (not (get verified donation-data)) ERR-ALREADY-VERIFIED)
+        (map-set basic-donations { donation-id: donation-id }
+            (merge donation-data {
+                status: "verified",
+                verified: true,
+            })
+        )
+        (map-set matched-donations { donation-id: donation-id }
+            (merge matched-data { verified: true })
+        )
+        (ok true)
+    )
+)
+
+(define-public (deactivate-pledge (pledge-id uint))
+    (let (
+            (pledge-data (unwrap! (map-get? matching-pledges { pledge-id: pledge-id })
+                ERR-PLEDGE-NOT-FOUND
+            ))
+            (pledger-key { pledger: (get pledger pledge-data) })
+            (current-stats (default-to {
+                total-pledges-created: u0,
+                total-amount-pledged: u0,
+                total-amount-matched: u0,
+                active-pledges: u0,
+            }
+                (map-get? pledge-stats pledger-key)
+            ))
+        )
+        (asserts! (is-eq tx-sender (get pledger pledge-data)) ERR-NOT-AUTHORIZED)
+        (asserts! (get active pledge-data) (err u428))
+        (map-set matching-pledges { pledge-id: pledge-id }
+            (merge pledge-data { active: false })
+        )
+        (map-set pledge-stats pledger-key {
+            total-pledges-created: (get total-pledges-created current-stats),
+            total-amount-pledged: (get total-amount-pledged current-stats),
+            total-amount-matched: (get total-amount-matched current-stats),
+            active-pledges: (- (get active-pledges current-stats) u1),
+        })
+        (ok true)
+    )
+)
+
+(define-read-only (get-matching-pledge (pledge-id uint))
+    (map-get? matching-pledges { pledge-id: pledge-id })
+)
+
+(define-read-only (get-matched-donation (donation-id uint))
+    (map-get? matched-donations { donation-id: donation-id })
+)
+
+(define-read-only (get-pledge-stats (pledger principal))
+    (map-get? pledge-stats { pledger: pledger })
+)
+
+(define-read-only (get-pledge-efficiency (pledge-id uint))
+    (match (map-get? matching-pledges { pledge-id: pledge-id })
+        pledge-data (let (
+                (utilized (- (get max-match-amount pledge-data)
+                    (get remaining-amount pledge-data)
+                ))
+                (efficiency (/ (* utilized u100) (get max-match-amount pledge-data)))
+            )
+            (ok {
+                total-pledged: (get max-match-amount pledge-data),
+                amount-utilized: utilized,
+                remaining-funds: (get remaining-amount pledge-data),
+                utilization-rate: efficiency,
+            })
+        )
+        ERR-PLEDGE-NOT-FOUND
+    )
+)
