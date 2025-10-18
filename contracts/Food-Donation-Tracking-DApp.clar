@@ -966,3 +966,253 @@
         ERR-PLEDGE-NOT-FOUND
     )
 )
+
+(define-constant ERR-POOL-NOT-FOUND (err u430))
+(define-constant ERR-POOL-CLOSED (err u431))
+(define-constant ERR-POOL-EXPIRED (err u432))
+(define-constant ERR-GOAL-ALREADY-REACHED (err u433))
+(define-constant ERR-GOAL-NOT-REACHED (err u434))
+(define-constant ERR-NO-CONTRIBUTION (err u435))
+(define-constant ERR-POOL-ALREADY-CLAIMED (err u436))
+
+(define-data-var next-pool-id uint u1)
+
+(define-map donation-pools
+    { pool-id: uint }
+    {
+        creator: principal,
+        recipient: principal,
+        target-amount: uint,
+        raised-amount: uint,
+        deadline: uint,
+        created-at: uint,
+        status: (string-ascii 20),
+        contributor-count: uint,
+    }
+)
+
+(define-map pool-contributions
+    {
+        pool-id: uint,
+        contributor: principal,
+    }
+    {
+        amount: uint,
+        contributed-at: uint,
+        refunded: bool,
+    }
+)
+
+(define-map contributor-pools
+    { contributor: principal }
+    {
+        total-pools-joined: uint,
+        total-contributed: uint,
+        total-refunded: uint,
+        successful-contributions: uint,
+    }
+)
+
+(define-public (create-donation-pool
+        (recipient principal)
+        (target-amount uint)
+        (deadline-blocks uint)
+    )
+    (let (
+            (pool-id (var-get next-pool-id))
+            (current-block burn-block-height)
+            (deadline (+ current-block deadline-blocks))
+        )
+        (asserts! (> target-amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (> deadline-blocks u0) (err u437))
+        (map-set donation-pools { pool-id: pool-id } {
+            creator: tx-sender,
+            recipient: recipient,
+            target-amount: target-amount,
+            raised-amount: u0,
+            deadline: deadline,
+            created-at: current-block,
+            status: "active",
+            contributor-count: u0,
+        })
+        (var-set next-pool-id (+ pool-id u1))
+        (ok pool-id)
+    )
+)
+
+(define-public (contribute-to-pool
+        (pool-id uint)
+        (amount uint)
+    )
+    (let (
+            (pool-data (unwrap! (map-get? donation-pools { pool-id: pool-id })
+                ERR-POOL-NOT-FOUND
+            ))
+            (current-block burn-block-height)
+            (contribution-key {
+                pool-id: pool-id,
+                contributor: tx-sender,
+            })
+            (existing-contribution (default-to {
+                amount: u0,
+                contributed-at: current-block,
+                refunded: false,
+            }
+                (map-get? pool-contributions contribution-key)
+            ))
+            (contributor-key { contributor: tx-sender })
+            (contributor-stats (default-to {
+                total-pools-joined: u0,
+                total-contributed: u0,
+                total-refunded: u0,
+                successful-contributions: u0,
+            }
+                (map-get? contributor-pools contributor-key)
+            ))
+            (new-raised (+ (get raised-amount pool-data) amount))
+            (is-new-contributor (is-eq (get amount existing-contribution) u0))
+        )
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (is-eq (get status pool-data) "active") ERR-POOL-CLOSED)
+        (asserts! (< current-block (get deadline pool-data)) ERR-POOL-EXPIRED)
+        (map-set pool-contributions contribution-key {
+            amount: (+ (get amount existing-contribution) amount),
+            contributed-at: current-block,
+            refunded: false,
+        })
+        (map-set donation-pools { pool-id: pool-id }
+            (merge pool-data {
+                raised-amount: new-raised,
+                contributor-count: (if is-new-contributor
+                    (+ (get contributor-count pool-data) u1)
+                    (get contributor-count pool-data)
+                ),
+                status: (if (>= new-raised (get target-amount pool-data))
+                    "funded"
+                    "active"
+                ),
+            })
+        )
+        (map-set contributor-pools contributor-key {
+            total-pools-joined: (if is-new-contributor
+                (+ (get total-pools-joined contributor-stats) u1)
+                (get total-pools-joined contributor-stats)
+            ),
+            total-contributed: (+ (get total-contributed contributor-stats) amount),
+            total-refunded: (get total-refunded contributor-stats),
+            successful-contributions: (get successful-contributions contributor-stats),
+        })
+        (ok true)
+    )
+)
+
+(define-public (claim-pool-funds (pool-id uint))
+    (let (
+            (pool-data (unwrap! (map-get? donation-pools { pool-id: pool-id })
+                ERR-POOL-NOT-FOUND
+            ))
+            (current-block burn-block-height)
+        )
+        (asserts! (is-eq tx-sender (get recipient pool-data)) ERR-NOT-AUTHORIZED)
+        (asserts!
+            (>= (get raised-amount pool-data) (get target-amount pool-data))
+            ERR-GOAL-NOT-REACHED
+        )
+        (asserts! (not (is-eq (get status pool-data) "claimed"))
+            ERR-POOL-ALREADY-CLAIMED
+        )
+        (map-set donation-pools { pool-id: pool-id }
+            (merge pool-data { status: "claimed" })
+        )
+        (ok (get raised-amount pool-data))
+    )
+)
+
+(define-public (request-refund (pool-id uint))
+    (let (
+            (pool-data (unwrap! (map-get? donation-pools { pool-id: pool-id })
+                ERR-POOL-NOT-FOUND
+            ))
+            (current-block burn-block-height)
+            (contribution-key {
+                pool-id: pool-id,
+                contributor: tx-sender,
+            })
+            (contribution-data (unwrap! (map-get? pool-contributions contribution-key)
+                ERR-NO-CONTRIBUTION
+            ))
+            (contributor-key { contributor: tx-sender })
+            (contributor-stats (default-to {
+                total-pools-joined: u0,
+                total-contributed: u0,
+                total-refunded: u0,
+                successful-contributions: u0,
+            }
+                (map-get? contributor-pools contributor-key)
+            ))
+        )
+        (asserts! (>= current-block (get deadline pool-data)) (err u438))
+        (asserts! (< (get raised-amount pool-data) (get target-amount pool-data))
+            ERR-GOAL-ALREADY-REACHED
+        )
+        (asserts! (not (get refunded contribution-data)) (err u439))
+        (map-set pool-contributions contribution-key
+            (merge contribution-data { refunded: true })
+        )
+        (map-set contributor-pools contributor-key {
+            total-pools-joined: (get total-pools-joined contributor-stats),
+            total-contributed: (get total-contributed contributor-stats),
+            total-refunded: (+ (get total-refunded contributor-stats)
+                (get amount contribution-data)
+            ),
+            successful-contributions: (get successful-contributions contributor-stats),
+        })
+        (ok (get amount contribution-data))
+    )
+)
+
+(define-public (finalize-successful-pool (pool-id uint))
+    (let ((pool-data (unwrap! (map-get? donation-pools { pool-id: pool-id })
+            ERR-POOL-NOT-FOUND
+        )))
+        (asserts! (is-eq (get status pool-data) "claimed") (err u440))
+        (ok true)
+    )
+)
+
+(define-read-only (get-donation-pool (pool-id uint))
+    (map-get? donation-pools { pool-id: pool-id })
+)
+
+(define-read-only (get-pool-contribution
+        (pool-id uint)
+        (contributor principal)
+    )
+    (map-get? pool-contributions {
+        pool-id: pool-id,
+        contributor: contributor,
+    })
+)
+
+(define-read-only (get-contributor-stats (contributor principal))
+    (map-get? contributor-pools { contributor: contributor })
+)
+
+(define-read-only (get-pool-progress (pool-id uint))
+    (match (map-get? donation-pools { pool-id: pool-id })
+        pool-data (ok {
+            target: (get target-amount pool-data),
+            raised: (get raised-amount pool-data),
+            remaining: (if (> (get target-amount pool-data) (get raised-amount pool-data))
+                (- (get target-amount pool-data) (get raised-amount pool-data))
+                u0
+            ),
+            progress-percentage: (/ (* (get raised-amount pool-data) u100)
+                (get target-amount pool-data)
+            ),
+            contributors: (get contributor-count pool-data),
+            status: (get status pool-data),
+        })
+        ERR-POOL-NOT-FOUND
+    )
+)
