@@ -1216,3 +1216,52 @@
         ERR-POOL-NOT-FOUND
     )
 )
+
+(define-map donation-metadata
+    { donation-id: uint }
+    {
+        category: (string-ascii 32),
+        location: (string-ascii 64),
+        food-type: (string-ascii 32),
+        expires-at: (optional uint),
+        created-at: uint,
+        updated-at: uint,
+    }
+)
+
+(define-public (set-donation-metadata
+        (donation-id uint)
+        (category (string-ascii 32))
+        (location (string-ascii 64))
+        (food-type (string-ascii 32))
+        (expires-at (optional uint))
+    )
+    (let (
+            (donation (unwrap! (map-get? basic-donations { donation-id: donation-id })
+                ERR-DONATION-NOT-FOUND
+            ))
+            (is-donor (is-eq tx-sender (get donor donation)))
+            (is-admin (is-eq tx-sender (var-get admin)))
+            (current-block burn-block-height)
+            (existing (map-get? donation-metadata { donation-id: donation-id }))
+            (created-at (match existing
+                metadata (get created-at metadata)
+                current-block
+            ))
+        )
+        (asserts! (or is-donor is-admin) ERR-NOT-AUTHORIZED)
+        (map-set donation-metadata { donation-id: donation-id } {
+            category: category,
+            location: location,
+            food-type: food-type,
+            expires-at: expires-at,
+            created-at: created-at,
+            updated-at: current-block,
+        })
+        (ok true)
+    )
+)
+
+(define-read-only (get-donation-metadata (donation-id uint))
+    (map-get? donation-metadata { donation-id: donation-id })
+)
